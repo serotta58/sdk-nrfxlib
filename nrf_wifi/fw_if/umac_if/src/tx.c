@@ -19,6 +19,11 @@
 #include "hal_mem.h"
 #include "fmac_util.h"
 
+#define GLENS_LOST_PACKETS_FIX	1
+#ifdef GLENS_LOST_PACKETS_FIX
+#include <zephyr/kernel.h>		// for k_sleep()
+#endif
+
 static bool is_twt_emergency_pkt(struct nrf_wifi_osal_priv *opriv, void *nwb)
 {
 	unsigned char priority = nrf_wifi_osal_nbuf_get_priority(opriv, nwb);
@@ -38,9 +43,9 @@ static bool can_xmit(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 	    def_dev_ctx->twt_sleep_status == NRF_WIFI_FMAC_TWT_STATE_AWAKE;
 }
 
-/* Set the coresponding bit of access category.
- * First 4 bits(0 to 3) represenst first spare desc access cateogories
- * Second 4 bits(4 to 7) represenst second spare desc access cateogories and so on
+/* Set the corresponding bit of access category.
+ * First 4 bits(0 to 3) represents first spare desc access categories
+ * Second 4 bits(4 to 7) represents second spare desc access categories and so on
  */
 static void set_spare_desc_q_map(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 				 unsigned int desc,
@@ -67,9 +72,9 @@ static void set_spare_desc_q_map(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 }
 
 
-/* Clear the coresponding bit of access category.
- * First 4 bits(0 to 3) represenst first spare desc access cateogories
- * Second 4 bits(4 to 7) represenst second spare desc access cateogories and so on
+/* Clear the corresponding bit of access category.
+ * First 4 bits(0 to 3) represents first spare desc access categories
+ * Second 4 bits(4 to 7) represents second spare desc access categories and so on
  */
 static void clear_spare_desc_q_map(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 				   unsigned int desc,
@@ -238,7 +243,6 @@ unsigned int tx_desc_get(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 	/* First search for a reserved desc */
 
 	for (cnt = 0; cnt < def_priv->num_tx_tokens_per_ac; cnt++) {
-		curr_bit = ((queue + (NRF_WIFI_FMAC_AC_MAX * cnt)));
 		curr_bit = ((queue + (NRF_WIFI_FMAC_AC_MAX * cnt)) % TX_DESC_BUCKET_BOUND);
 		pool_id = ((queue + (NRF_WIFI_FMAC_AC_MAX * cnt)) / TX_DESC_BUCKET_BOUND);
 
@@ -526,7 +530,7 @@ size_t _tx_pending_process(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 	}
 
 	/* If our criterion rejects all pending frames, or
-	 * pend_q is empty, send only 1
+	 * txq is empty, send only 1
 	 */
 	if (!nrf_wifi_utils_q_len(fmac_dev_ctx->fpriv->opriv, txq)) {
 		nwb = nrf_wifi_utils_q_dequeue(fmac_dev_ctx->fpriv->opriv,
@@ -1052,7 +1056,9 @@ enum nrf_wifi_status tx_enqueue(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 {
 	enum nrf_wifi_status status = NRF_WIFI_STATUS_FAIL;
 	void *queue = NULL;
+#ifndef GLENS_LOST_PACKETS_FIX
 	int qlen = 0;
+#endif
 	struct nrf_wifi_fmac_dev_ctx_def *def_dev_ctx = NULL;
 
 	def_dev_ctx = wifi_dev_priv(fmac_dev_ctx);
@@ -1066,11 +1072,13 @@ enum nrf_wifi_status tx_enqueue(struct nrf_wifi_fmac_dev_ctx *fmac_dev_ctx,
 
 	queue = def_dev_ctx->tx_config.data_pending_txq[peer_id][ac];
 
+#ifndef GLENS_LOST_PACKETS_FIX
 	qlen = nrf_wifi_utils_q_len(fmac_dev_ctx->fpriv->opriv, queue);
 
 	if (qlen >= CONFIG_NRF700X_MAX_TX_PENDING_QLEN) {
 		goto out;
 	}
+#endif
 
 	if (is_twt_emergency_pkt(fmac_dev_ctx->fpriv->opriv, nwb)) {
 		nrf_wifi_utils_q_enqueue_head(fmac_dev_ctx->fpriv->opriv,
@@ -1538,6 +1546,31 @@ enum nrf_wifi_fmac_tx_status nrf_wifi_fmac_tx(struct nrf_wifi_fmac_dev_ctx *fmac
 	fpriv = fmac_dev_ctx->fpriv;
 	def_dev_ctx = wifi_dev_priv(fmac_dev_ctx);
 	def_priv = wifi_fmac_priv(fpriv);
+
+#ifdef GLENS_LOST_PACKETS_FIX
+	// Look ahead and see if the high water mark on the pending queue has been reached
+	// (or will be with this packet) and go into a sleep and check loop here until the queue
+	// has space.  This must be done outside of the tx_lock spinlock or the TX done processing
+	// thread (called when ISRs come from the RPU) will be blocked since it also takes this lock,
+	// and the queue we are waiting for will never be processed.
+	void *queue = def_dev_ctx->tx_config.data_pending_txq[peer_id][ac];
+	int qlen = nrf_wifi_utils_q_len(fmac_dev_ctx->fpriv->opriv, queue);
+	
+	k_timepoint_t timeout_end = sys_timepoint_calc(K_MSEC(10000));
+
+	while (qlen >= CONFIG_NRF700X_MAX_TX_PENDING_QLEN)
+	{
+		k_sleep(K_MSEC(3));
+		qlen = nrf_wifi_utils_q_len(fmac_dev_ctx->fpriv->opriv, queue);
+		// if (qlen) {
+		// 	nrf_wifi_osal_log_info(fmac_dev_ctx->fpriv->opriv, "qlen: %d", qlen);
+		// }
+		if (sys_timepoint_expired(timeout_end)) {
+			nrf_wifi_osal_log_info(fmac_dev_ctx->fpriv->opriv, "Wait for tx pending queue timed out.  Packet discarded.");
+			return NRF_WIFI_FMAC_TX_STATUS_FAIL;
+		}
+	}
+#endif
 
 	nrf_wifi_osal_spinlock_take(fmac_dev_ctx->fpriv->opriv,
 				    def_dev_ctx->tx_config.tx_lock);
